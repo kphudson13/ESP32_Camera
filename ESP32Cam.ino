@@ -60,7 +60,7 @@ bool initCamera() {
 
   config.frame_size = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
-  config.fb_count = 1;
+  config.fb_count = 2;
 
   return esp_camera_init(&config) == ESP_OK;
 }
@@ -77,7 +77,6 @@ uint8_t WiFiConnect(const char* nSSID, const char* nPassword) {
     delay(250);
     Serial.print(".");
   }
-
   Serial.println();  // Just make a new line after loading dots
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -93,7 +92,8 @@ uint8_t WiFiConnect(const char* nSSID, const char* nPassword) {
 void setup() {
 
   Serial.begin(115200);
-  Serial.println("Setup started!");  // Add this line
+  delay(1000);  // initial delay 1sec
+  Serial.println("Setup started!");
   if (!WiFiConnect(ssid, password))
     return;
 
@@ -114,11 +114,18 @@ void setup() {
 
 void loop() {
 
-  delay(1000);  // initial delay 1sec
+  // Double check wifi is connected
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(5000);
+  }
 
   // Capture the photo
   Serial.println("Attempting to capture photo...");
   camera_fb_t* fb = esp_camera_fb_get();
+  if (fb) esp_camera_fb_return(fb);  // discard stale frame
+  delay(100);                        // allow new capture
+  fb = esp_camera_fb_get();          // This is the fresh photo
   if (!fb) {
     Serial.println("Camera capture failed");
     return;
@@ -151,6 +158,7 @@ void loop() {
   // SEND
   if (!smtp.connect(&session)) {
     Serial.println("SMTP connect failed");
+    esp_camera_fb_return(fb);  // clear camera buffer incase smtp fails
     return;
   }
   if (!MailClient.sendMail(&smtp, &message))
