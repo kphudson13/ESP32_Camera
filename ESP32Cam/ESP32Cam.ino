@@ -1,6 +1,7 @@
 /* 
 A script to send pictures from an esp32-cam via email
 You need a credentials file to make this work 
+This esp32 also collects data from another module via ESP-NOW
 Jan 2026 
 Kyle Hudson
 Live laugh love
@@ -9,6 +10,8 @@ Live laugh love
 #include "esp_camera.h"       // include library for the camera
 #include <WiFi.h>             // for wifi connection
 #include <ESP_Mail_Client.h>  // for mail client
+#include <esp_now.h>          // To talk to other esp32
+#include <RTClib.h>           // To convert data packet from unix time
 #include "credentials.h"      // personal credentials file, not tracked with Git
 
 // set pin configurations - #define replaces all the first value with the second before it hits the compiler
@@ -29,9 +32,26 @@ Live laugh love
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
+// Delay email send
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 14400000;  // 4 hours
+
 // SMTP objects
 SMTPSession smtp;
 ESP_Mail_Session session;
+
+// Replace with the partner ESP32 MAC address
+//uint8_t partnerMac[] = { 0xE4, 0xB0, 0x63, 0xB4, 0x2F, 0xE8 };
+
+// structure for data from other esp
+typedef struct {
+  float temperature;
+  float humidity;
+  uint32_t unixTime;
+} sensor_packet_t;
+
+sensor_packet_t lastPacket;
+bool hasPacket = false;
 
 // Camera function
 bool initCamera() {
@@ -89,14 +109,44 @@ uint8_t WiFiConnect(const char* nSSID, const char* nPassword) {
   return true;
 }
 
+void onReceive(const esp_now_recv_info_t* info,
+               const uint8_t* data,
+               int len) {
+
+  Serial.println("ESP-NOW PACKET RECEIVED");
+
+  memcpy(&lastPacket, data, sizeof(lastPacket));
+  hasPacket = true;
+}
+
 void setup() {
 
   Serial.begin(115200);
   delay(1000);  // initial delay 1sec
   Serial.println("Setup started!");
+
+  // Initialize ESP-NOW
+  WiFi.mode(WIFI_STA);
+
   if (!WiFiConnect(ssid, password))
     return;
 
+  // Wait for WiFi to start
+  while (WiFi.macAddress() == "00:00:00:00:00:00") {
+    delay(100);
+  }
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  // IMPORTANT: re-init ESP-NOW after Wi-Fi is connected
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+
+  // initialize camera
   Serial.println("Starting camera initialization...");
   if (!initCamera()) {
     Serial.println("Camera init failed");
@@ -110,9 +160,25 @@ void setup() {
   sensor_t* s = esp_camera_sensor_get();
   s->set_vflip(s, 1);    // vertical flip becasue photo is upside down
   s->set_hmirror(s, 1);  // horizontal mirror (optional)
+
+  lastSendTime = millis() - sendInterval;
 }
 
 void loop() {
+
+  // Check for data packet
+  if (!hasPacket) {
+    Serial.println("No packet detected");
+    delay(5000);
+    return;
+  }
+
+  // Check if 4 hours have passed since last email
+  if (millis() - lastSendTime < sendInterval) {
+    Serial.println("Waiting for email delay");
+    delay(3000);  // Keep latest packet, wait for next window
+    return;
+  }
 
   // Double check wifi is connected
   if (WiFi.status() != WL_CONNECTED) {
@@ -143,9 +209,13 @@ void loop() {
   SMTP_Message message;
   message.sender.name = "ESP32-CAM";
   message.sender.email = smtp_email;
-  message.subject = "Automated Photo";
+  message.subject = "Automated Apt. Data";
   message.addRecipient("Kyle", recip_email);
-  message.text.content = "Photo attached.";
+  message.text.content = "Photo attached.\n";
+  // Use this:
+  DateTime timestamp(lastPacket.unixTime);
+  message.text.content += "Data from : " + String(timestamp.year()) + "-" + String(timestamp.month()) + "-" + String(timestamp.day()) + " " + String(timestamp.hour()) + ":" + String(timestamp.minute()) + ":" + String(timestamp.second()) + "\n";
+  message.text.content += "Temp: " + String(lastPacket.temperature, 1) + "C Hum: " + String(lastPacket.humidity, 0) + "%";
   message.text.charSet = "us-ascii";
   SMTP_Attachment att;
   att.descr.filename = "photo.jpg";
@@ -166,10 +236,12 @@ void loop() {
   else
     Serial.println("Email sent successfully");
 
+  lastSendTime = millis();  // reset timer ONLY AFTER sending email
+
   esp_camera_fb_return(fb);  // clear frame buffer for RAM management
   smtp.closeSession();       // Add after sending email
 
-  Serial.println("Delay till next cycle...");
+  hasPacket = false;  // Reset flag to wait for new packet
 
-  delay(14400000);  // 4 hours
+  Serial.println("Delay till next cycle...");
 }
