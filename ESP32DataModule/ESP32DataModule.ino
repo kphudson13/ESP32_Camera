@@ -112,7 +112,7 @@ if (rtc.lostPower() | Serial) {
   delay(1500);
   }
 
-  delay(200);  // Minor delay to let modules stablize
+  delay(200);  // Minor delay to let modules stablize.
 }
 
 void loop() {
