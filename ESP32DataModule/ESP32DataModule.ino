@@ -5,14 +5,24 @@ Kyle Hudson
 Live laugh love
 */
 
-#include <DHT.h>
-#include <RTClib.h>
-#include <Wire.h>
-#include <esp_now.h>
-#include <WiFi.h>
+#include <DHT.h>               // For DHT module
+#include <RTClib.h>            // Clock module
+#include <Wire.h>              // I2C protocol
+#include <esp_now.h>           // Esp now communication
+#include <WiFi.h>              // Connect to wifi
+#include <Adafruit_GFX.h>      // Digital display
+#include <Adafruit_SSD1306.h>  // Digital display
 
-#define DHTPIN 19
+#define DHTPIN 19  // For DHT
 #define DHTTYPE DHT22
+
+// For digital display
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1  // No reset pin
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 RTC_DS3231 rtc;
 DHT dht(DHTPIN, DHTTYPE);
@@ -28,6 +38,8 @@ typedef struct {
 
 sensor_packet_t packet;
 
+bool oledOK = false; // to allow oled to fail
+
 // to confirm data sent
 void onSend(const wifi_tx_info_t *info, esp_now_send_status_t status) {
   Serial.println("Packet sent (ack may fail due to WiFi mode)");
@@ -37,7 +49,7 @@ void setup() {
   Serial.begin(115200);
 
   // Start I2C on custom pins
-  Wire.begin(15, 16);  // SDA, SCL
+  Wire.begin(15, 16);  // SDA, SCL. For clock module and OLED
 
   dht.begin();
 
@@ -48,18 +60,27 @@ void setup() {
     return;
   }
 
+  /* Only need this to get mac address once
   // Wait for WiFi to start
   while (WiFi.macAddress() == "00:00:00:00:00:00") {
     delay(100);
   }
   Serial.print("MAC: ");
   Serial.println(WiFi.macAddress());
+*/
 
+  // Check we can find clock module
   if (!rtc.begin()) {
     Serial.println("Couldn't find DS3231");
     while (1)
       ;
   }
+
+  // Auto-sync RTC when connected to Serial (USB)
+if (rtc.lostPower() | Serial) {
+  Serial.println("Syncing RTC to compile time");
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+}
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, partnerMac, 6);
@@ -73,9 +94,22 @@ void setup() {
 
   esp_now_register_send_cb(onSend);
 
-  // set RTC 
-  if (rtc.lostPower()) {
-  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+   // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("OLED allocation failed");
+    oledOK = false;
+} else {
+  oledOK = true;
+
+  // Initial display before data
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("ESP32 Sender");
+  display.println("Live laugh love");
+  display.display();
+  delay(1500);
   }
 
   delay(200);  // Minor delay to let modules stablize
@@ -95,6 +129,44 @@ void loop() {
     return;
   }
 
+if (oledOK) { // Wrapped in if incase OLED fails
+  display.clearDisplay();
+
+  // TIME (big font)
+  display.setTextSize(2);
+
+  // Build time string
+  char timeStr[6];  // "HH:MM"
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d", now.hour(), now.minute());
+
+  // Calculate text width (6 px per char × text size)
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+
+  // Center horizontally
+  int16_t x = (SCREEN_WIDTH - w) / 2;
+
+  display.setCursor(x, 0);
+  display.print(timeStr);
+
+  // Separator ----
+  display.setTextSize(1);    // Back to normal size
+  display.setCursor(0, 24);  // Move down below large time
+  display.println("---------------------");
+
+  // Temp & Humidity
+  display.print("Temp: ");
+  display.print(packet.temperature, 1);
+  display.println(" C");
+
+  display.print("Hum:  ");
+  display.print(packet.humidity, 1);
+  display.println(" %");
+
+  display.display();
+}
+
   esp_err_t result = esp_now_send(partnerMac,
                                   (uint8_t *)&packet,
                                   sizeof(packet));
@@ -105,6 +177,7 @@ void loop() {
     Serial.println("ESP-NOW send FAIL");
   }
 
+  // All just to print in the serial monitor
   Serial.print(now.year());
   Serial.print("-");
   Serial.print(now.month());
@@ -122,5 +195,5 @@ void loop() {
   Serial.print("Hum: ");
   Serial.println(packet.humidity);
   Serial.println("--------------------");
-  delay(6000);
+  delay(15000);
 }

@@ -36,6 +36,10 @@ Live laugh love
 unsigned long lastSendTime = 0;
 const unsigned long sendInterval = 14400000;  // 4 hours
 
+// For backup incase no temp data is recieved
+unsigned long packetWaitStart = 0;
+const unsigned long packetTimeout = 300000;  // 5 minutes
+
 // SMTP objects
 SMTPSession smtp;
 ESP_Mail_Session session;
@@ -80,7 +84,7 @@ bool initCamera() {
 
   config.frame_size = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
-  config.fb_count = 2;
+  config.fb_count = 1;  // Allows only one frame cached
 
   return esp_camera_init(&config) == ESP_OK;
 }
@@ -166,18 +170,30 @@ void setup() {
 
 void loop() {
 
-  // Check for data packet
-  if (!hasPacket) {
-    Serial.println("No packet detected");
-    delay(5000);
-    return;
-  }
-
-  // Check if 4 hours have passed since last email
+   // Check if 4 hours have passed since last email
   if (millis() - lastSendTime < sendInterval) {
     Serial.println("Waiting for email delay");
     delay(3000);  // Keep latest packet, wait for next window
     return;
+  }
+
+  // Check for data packet
+  if (packetWaitStart == 0) {
+    packetWaitStart = millis();
+  }
+
+  // If no packet yet AND timeout not reached → wait
+  if (!hasPacket && millis() - packetWaitStart < packetTimeout) {
+    Serial.println("Waiting for ESP-NOW data...");
+    delay(5000);
+    return;
+  }
+
+  // If timeout reached with no packet → continue anyway
+  bool packetTimedOut = false;
+  if (!hasPacket) {
+    Serial.println("ESP-NOW timeout reached");
+    packetTimedOut = true;
   }
 
   // Double check wifi is connected
@@ -212,10 +228,14 @@ void loop() {
   message.subject = "Automated Apt. Data";
   message.addRecipient("Kyle", recip_email);
   message.text.content = "Photo attached.\n";
-  // Use this:
-  DateTime timestamp(lastPacket.unixTime);
-  message.text.content += "Data from : " + String(timestamp.year()) + "-" + String(timestamp.month()) + "-" + String(timestamp.day()) + " " + String(timestamp.hour()) + ":" + String(timestamp.minute()) + ":" + String(timestamp.second()) + "\n";
-  message.text.content += "Temp: " + String(lastPacket.temperature, 1) + "C Hum: " + String(lastPacket.humidity, 0) + "%";
+
+  if (packetTimedOut) {
+    message.text.content += "Temperature data is not available.\n";
+  } else {
+    DateTime timestamp(lastPacket.unixTime);
+    message.text.content += "Data from : " + String(timestamp.year()) + "-" + String(timestamp.month()) + "-" + String(timestamp.day()) + " " + String(timestamp.hour()) + ":" + String(timestamp.minute()) + ":" + String(timestamp.second()) + "\n";
+    message.text.content += "Temp: " + String(lastPacket.temperature, 1) + "C Hum: " + String(lastPacket.humidity, 0) + "%";
+  }
   message.text.charSet = "us-ascii";
   SMTP_Attachment att;
   att.descr.filename = "photo.jpg";
@@ -242,6 +262,7 @@ void loop() {
   smtp.closeSession();       // Add after sending email
 
   hasPacket = false;  // Reset flag to wait for new packet
+  packetWaitStart = 0;
 
   Serial.println("Delay till next cycle...");
 }
