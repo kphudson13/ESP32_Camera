@@ -38,7 +38,7 @@ typedef struct {
 
 sensor_packet_t packet;
 
-bool oledOK = false; // to allow oled to fail
+bool oledOK = false;  // to allow oled to fail
 
 // to confirm data sent
 void onSend(const wifi_tx_info_t *info, esp_now_send_status_t status) {
@@ -52,6 +52,12 @@ void setup() {
   Wire.begin(15, 16);  // SDA, SCL. For clock module and OLED
 
   dht.begin();
+
+  // To allow serial monitor to configure
+  unsigned long start = millis();
+  while (!Serial && millis() - start < 2000) {
+    delay(10);
+  }
 
   // ESP-NOW setup
   WiFi.mode(WIFI_STA);
@@ -75,12 +81,13 @@ void setup() {
     while (1)
       ;
   }
+  // Only uncomment this to reset time to computer system
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
-  // Auto-sync RTC when connected to Serial (USB)
-if (rtc.lostPower() | Serial) {
-  Serial.println("Syncing RTC to compile time");
-  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-}
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, syncing to compile time");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, partnerMac, 6);
@@ -94,22 +101,22 @@ if (rtc.lostPower() | Serial) {
 
   esp_now_register_send_cb(onSend);
 
-   // Initialize OLED
+  // Initialize OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println("OLED allocation failed");
     oledOK = false;
-} else {
-  oledOK = true;
+  } else {
+    oledOK = true;
 
-  // Initial display before data
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("ESP32 Sender");
-  display.println("Live laugh love");
-  display.display();
-  delay(1500);
+    // Initial display before data
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("ESP32 Sender");
+    display.println("Live laugh love");
+    display.display();
+    delay(1500);
   }
 
   delay(200);  // Minor delay to let modules stablize.
@@ -129,43 +136,43 @@ void loop() {
     return;
   }
 
-if (oledOK) { // Wrapped in if incase OLED fails
-  display.clearDisplay();
+  if (oledOK) {  // Wrapped in if incase OLED fails
+    display.clearDisplay();
 
-  // TIME (big font)
-  display.setTextSize(2);
+    // TIME (big font)
+    display.setTextSize(2);
 
-  // Build time string
-  char timeStr[6];  // "HH:MM"
-  snprintf(timeStr, sizeof(timeStr), "%02d:%02d", now.hour(), now.minute());
+    // Build time string
+    char timeStr[6];  // "HH:MM"
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", now.hour(), now.minute());
 
-  // Calculate text width (6 px per char × text size)
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+    // Calculate text width (6 px per char × text size)
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
 
-  // Center horizontally
-  int16_t x = (SCREEN_WIDTH - w) / 2;
+    // Center horizontally
+    int16_t x = (SCREEN_WIDTH - w) / 2;
 
-  display.setCursor(x, 0);
-  display.print(timeStr);
+    display.setCursor(x, 0);
+    display.print(timeStr);
 
-  // Separator ----
-  display.setTextSize(1);    // Back to normal size
-  display.setCursor(0, 24);  // Move down below large time
-  display.println("---------------------");
+    // Separator ----
+    display.setTextSize(1);    // Back to normal size
+    display.setCursor(0, 24);  // Move down below large time
+    display.println("---------------------");
 
-  // Temp & Humidity
-  display.print("Temp: ");
-  display.print(packet.temperature, 1);
-  display.println(" C");
+    // Temp & Humidity
+    display.print("Temp: ");
+    display.print(packet.temperature, 1);
+    display.println(" C");
 
-  display.print("Hum:  ");
-  display.print(packet.humidity, 1);
-  display.println(" %");
+    display.print("Hum:  ");
+    display.print(packet.humidity, 1);
+    display.println(" %");
 
-  display.display();
-}
+    display.display();
+  }
 
   esp_err_t result = esp_now_send(partnerMac,
                                   (uint8_t *)&packet,
