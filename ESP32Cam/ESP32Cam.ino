@@ -13,6 +13,10 @@ Live laugh love
 #include <esp_now.h>          // To talk to other esp32
 #include <RTClib.h>           // To convert data packet from unix time
 #include "credentials.h"      // personal credentials file, not tracked with Git
+#include <SD_MMC.h>           // to use SD card
+#include <WebServer.h>        // to host web server
+
+WebServer server(80);
 
 // set pin configurations - #define replaces all the first value with the second before it hits the compiler
 #define PWDN_GPIO_NUM 32
@@ -32,15 +36,11 @@ Live laugh love
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-// Delay email send
-unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 14400000;  // 4 hours
+// The four target hours for photos
+const uint8_t PHOTO_HOURS[4] = { 0, 6, 12, 18 };
+const uint8_t EMAIL_HOUR = 18;  // Send email after 6pm photo
 
-// For backup incase no temp data is recieved
-unsigned long packetWaitStart = 0;
-const unsigned long packetTimeout = 300000;  // 5 minutes
-
-// SMTP objects
+// Simple Mail Transfer Protocol objects
 SMTPSession smtp;
 ESP_Mail_Session session;
 
@@ -56,6 +56,17 @@ typedef struct {
 
 sensor_packet_t lastPacket;
 bool hasPacket = false;
+
+// Track which photo slots have been taken today
+bool photoTaken[4] = { false, false, false, false };  // 12am, 6am, 12pm, 6pm
+bool emailSentToday = false;
+
+// Sensor readings saved at each photo time
+float savedTemps[4] = { NAN, NAN, NAN, NAN };
+float savedHums[4] = { NAN, NAN, NAN, NAN };
+uint32_t savedTimes[4] = { 0, 0, 0, 0 };
+
+int lastCheckedDay = -1;  // To detect day rollover
 
 // Camera function
 bool initCamera() {
@@ -78,10 +89,8 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-
   config.frame_size = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
   config.fb_count = 1;  // Allows only one frame cached
@@ -113,156 +122,275 @@ uint8_t WiFiConnect(const char* nSSID, const char* nPassword) {
   return true;
 }
 
-void onReceive(const esp_now_recv_info_t* info,
-               const uint8_t* data,
-               int len) {
-
-  Serial.println("ESP-NOW PACKET RECEIVED");
-
+void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  Serial.println("ESP-NOW packet received");
   memcpy(&lastPacket, data, sizeof(lastPacket));
   hasPacket = true;
 }
 
-void setup() {
+// Save photo to SD, returns filename or empty string on fail
+String savePhotoToSD(camera_fb_t* fb, uint8_t hour) {
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/photo_%02dh.jpg", hour);
 
-  Serial.begin(115200);
-  delay(1000);  // initial delay 1sec
-  Serial.println("Setup started!");
-
-  // Initialize ESP-NOW
-  WiFi.mode(WIFI_STA);
-
-  if (!WiFiConnect(ssid, password))
-    return;
-
-  // Wait for WiFi to start
-  while (WiFi.macAddress() == "00:00:00:00:00:00") {
-    delay(100);
-  }
-  Serial.print("MAC: ");
-  Serial.println(WiFi.macAddress());
-
-  // IMPORTANT: re-init ESP-NOW after Wi-Fi is connected
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed");
-    return;
+  File file = SD_MMC.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    return "";
   }
 
-  esp_now_register_recv_cb(onReceive);
+  file.write(fb->buf, fb->len);
+  file.close();
 
-  // initialize camera
-  Serial.println("Starting camera initialization...");
-  if (!initCamera()) {
-    Serial.println("Camera init failed");
-    return;
-  }
-  Serial.println("Camera initialized!");
-  delay(500);  // Give camera time to stabilize
-
-  // configure camera
-  Serial.println("Modifying photo sensor orientation");
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_vflip(s, 1);    // vertical flip becasue photo is upside down
-  s->set_hmirror(s, 1);  // horizontal mirror (optional)
-
-  lastSendTime = millis() - sendInterval;
+  Serial.print("Photo saved to SD: ");
+  Serial.println(filename);
+  return String(filename);
 }
 
-void loop() {
-
-   // Check if 4 hours have passed since last email
-  if (millis() - lastSendTime < sendInterval) {
-    Serial.println("Waiting for email delay");
-    delay(3000);  // Keep latest packet, wait for next window
-    return;
-  }
-
-  // Check for data packet
-  if (packetWaitStart == 0) {
-    packetWaitStart = millis();
-  }
-
-  // If no packet yet AND timeout not reached → wait
-  if (!hasPacket && millis() - packetWaitStart < packetTimeout) {
-    Serial.println("Waiting for ESP-NOW data...");
-    delay(5000);
-    return;
-  }
-
-  // If timeout reached with no packet → continue anyway
-  bool packetTimedOut = false;
-  if (!hasPacket) {
-    Serial.println("ESP-NOW timeout reached");
-    packetTimedOut = true;
-  }
-
-  // Double check wifi is connected
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-    delay(5000);
-  }
-
-  // Capture the photo
-  Serial.println("Attempting to capture photo...");
+// Discard stale frame, capture fresh one
+camera_fb_t* captureFreshPhoto() {
   camera_fb_t* fb = esp_camera_fb_get();
-  if (fb) esp_camera_fb_return(fb);  // discard stale frame
-  delay(100);                        // allow new capture
-  fb = esp_camera_fb_get();          // This is the fresh photo
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    return;
-  }
-  Serial.println("Photo captured!");
+  if (fb) esp_camera_fb_return(fb);
+  delay(100);
+  return esp_camera_fb_get();
+}
 
-  // SMTP CONFIG
+char attNames[4][32];  // Declare above the loop
+
+void sendDailyEmail() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, attempting reconnect...");
+    WiFiConnect(ssid, password);
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Reconnect failed, skipping email");
+      return;
+    }
+  }
+
   session.server.host_name = "smtp.gmail.com";
   session.server.port = 465;
   session.login.email = smtp_email;
   session.login.password = smtp_password;
   session.login.user_domain = "";
 
-  // MESSAGE
   SMTP_Message message;
   message.sender.name = "ESP32-CAM";
   message.sender.email = smtp_email;
-  message.subject = "Automated Apt. Data";
+  message.subject = "Daily Apt. Report";
   message.addRecipient("Kyle", recip_email);
-  message.text.content = "Photo attached.\n";
 
-  if (packetTimedOut) {
-    message.text.content += "Temperature data is not available.\n";
-  } else {
-    DateTime timestamp(lastPacket.unixTime);
-    message.text.content += "Data from : " + String(timestamp.year()) + "-" + String(timestamp.month()) + "-" + String(timestamp.day()) + " " + String(timestamp.hour()) + ":" + String(timestamp.minute()) + ":" + String(timestamp.second()) + "\n";
-    message.text.content += "Temp: " + String(lastPacket.temperature, 1) + "C Hum: " + String(lastPacket.humidity, 0) + "%";
+  const char* labels[4] = { "12:00 AM", "6:00 AM", "12:00 PM", "6:00 PM" };
+  const char* photoHourLabels[4] = { "12am", "6am", "12pm", "6pm" };
+
+  // Build body
+  String body = "Daily apartment report.\n\n";
+  for (int i = 0; i < 4; i++) {
+    body += String(labels[i]) + " — ";
+    if (savedTimes[i] != 0) {
+      body += "Temp: " + String(savedTemps[i], 1) + "C  Hum: " + String(savedHums[i], 0) + "%\n";
+    } else {
+      body += "No sensor data available\n";
+    }
   }
+  message.text.content = body.c_str();
   message.text.charSet = "us-ascii";
-  SMTP_Attachment att;
-  att.descr.filename = "photo.jpg";
-  att.descr.mime = "image/jpeg";
-  att.blob.data = fb->buf;
-  att.blob.size = fb->len;
-  att.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
-  message.addAttachment(att);
 
-  // SEND
+  // Attach photos from SD
+  SMTP_Attachment atts[4];
+  uint8_t* bufs[4] = { nullptr, nullptr, nullptr, nullptr };  // Track for cleanup
+
+  for (int i = 0; i < 4; i++) {
+    char filename[32];
+    snprintf(filename, sizeof(filename), "/photo_%02dh.jpg", PHOTO_HOURS[i]);
+
+    if (SD_MMC.exists(filename)) {
+      File f = SD_MMC.open(filename);
+      if (f) {
+        size_t fileSize = f.size();
+        bufs[i] = (uint8_t*)malloc(fileSize);
+        if (bufs[i]) {
+          f.read(bufs[i], fileSize);
+          f.close();
+
+          snprintf(attNames[i], sizeof(attNames[i]), "photo_%s.jpg", photoHourLabels[i]);
+
+          atts[i].descr.filename = attNames[i];
+          atts[i].descr.mime = "image/jpeg";
+          atts[i].blob.data = bufs[i];
+          atts[i].blob.size = fileSize;
+          atts[i].descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
+          message.addAttachment(atts[i]);
+
+          Serial.print("Attached: ");
+          Serial.println(attNames[i]);
+        } else {
+          Serial.println("malloc failed for photo attachment");
+          f.close();
+        }
+      }
+    } else {
+      Serial.print("Photo not found on SD: ");
+      Serial.println(filename);
+    }
+  }
+
   if (!smtp.connect(&session)) {
     Serial.println("SMTP connect failed");
-    esp_camera_fb_return(fb);  // clear camera buffer incase smtp fails
+    for (int i = 0; i < 4; i++) if (bufs[i]) free(bufs[i]);
     return;
   }
+
   if (!MailClient.sendMail(&smtp, &message))
     Serial.println(smtp.errorReason());
   else
-    Serial.println("Email sent successfully");
+    Serial.println("Daily email sent successfully");
 
-  lastSendTime = millis();  // reset timer ONLY AFTER sending email
+  smtp.closeSession();
 
-  esp_camera_fb_return(fb);  // clear frame buffer for RAM management
-  smtp.closeSession();       // Add after sending email
+  for (int i = 0; i < 4; i++) if (bufs[i]) free(bufs[i]);
+}
 
-  hasPacket = false;  // Reset flag to wait for new packet
-  packetWaitStart = 0;
+void handleRoot() {
+  String html = "<html><head>";
+  html += "<meta http-equiv='refresh' content='30'>";  // Auto refresh every 30s
+  html += "<style>body{font-family:sans-serif;padding:20px;} h1{color:#333;}</style>";
+  html += "</head><body>";
+  html += "<h1>Apartment Monitor</h1>";
 
-  Serial.println("Delay till next cycle...");
+  if (hasPacket) {
+    DateTime now(lastPacket.unixTime);
+    char timeStr[32];
+    snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
+             now.year(), now.month(), now.day(),
+             now.hour(), now.minute(), now.second());
+
+    html += "<p><b>Last updated:</b> " + String(timeStr) + "</p>";
+    html += "<p><b>Temperature:</b> " + String(lastPacket.temperature, 1) + " C</p>";
+    html += "<p><b>Humidity:</b> " + String(lastPacket.humidity, 0) + " %</p>";
+  } else {
+    html += "<p>No sensor data received yet.</p>";
+  }
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Setup started!");
+  delay(500);
+
+  Serial.println("Starting camera initialization...");
+  delay(500);
+  if (!initCamera()) {
+    Serial.println("Camera init failed");
+    return;
+  }
+  Serial.println("Camera initialized!");
+
+  if (!SD_MMC.begin()) {
+    Serial.println("SD card mount failed");
+    // Not fatal, photos just won't save
+  } else {
+    Serial.println("SD card mounted");
+  }
+
+  WiFi.mode(WIFI_STA);
+  if (!WiFiConnect(ssid, password)) return;
+
+  while (WiFi.macAddress() == "00:00:00:00:00:00") delay(100);
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  Serial.print("WiFi Channel: ");
+  Serial.println(WiFi.channel());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+  esp_now_register_recv_cb(onReceive);
+
+  server.on("/", handleRoot);
+  server.begin();
+  Serial.println("Web server started");
+  Serial.print("Visit: http://");
+  Serial.println(WiFi.localIP());
+
+  delay(500);
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
+
+  Serial.println("Waiting for first ESP-NOW time packet...");
+}
+
+void loop() {
+
+  // Can't do anything without a time reference
+  if (!hasPacket) {
+    Serial.println("No time data yet, waiting...");
+    delay(5000);
+    return;
+  }
+
+  DateTime now(lastPacket.unixTime);
+  int today = now.day();
+  uint8_t currentHour = now.hour();
+  uint8_t currentMinute = now.minute();
+
+  // Reset daily flags on day rollover
+  if (today != lastCheckedDay) {
+    Serial.println("New day detected, resetting daily flags");
+    for (int i = 0; i < 4; i++) {
+      photoTaken[i] = false;
+      savedTemps[i] = NAN;
+      savedHums[i] = NAN;
+      savedTimes[i] = 0;
+    }
+    emailSentToday = false;
+    lastCheckedDay = today;
+  }
+
+  // Check each photo slot
+  for (int i = 0; i < 4; i++) {
+    if (photoTaken[i]) continue;
+    if (currentHour != PHOTO_HOURS[i]) continue;
+
+    // Within the first 5 minutes of the target hour
+    if (currentMinute > 5) continue;
+
+    Serial.print("Taking scheduled photo for hour: ");
+    Serial.println(PHOTO_HOURS[i]);
+
+    camera_fb_t* fb = captureFreshPhoto();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      continue;
+    }
+
+    savePhotoToSD(fb, PHOTO_HOURS[i]);
+    esp_camera_fb_return(fb);
+
+    // Save sensor data at this time
+    savedTemps[i] = lastPacket.temperature;
+    savedHums[i] = lastPacket.humidity;
+    savedTimes[i] = lastPacket.unixTime;
+
+    photoTaken[i] = true;
+    Serial.println("Photo slot complete");
+  }
+
+  // Send email after 6pm photo is taken
+  if (!emailSentToday && photoTaken[3] && currentHour == EMAIL_HOUR) {
+    Serial.println("Sending daily email...");
+    sendDailyEmail();
+    emailSentToday = true;
+  }
+
+  server.handleClient();
+  
+  delay(30000);  // Check every 30 seconds
 }
