@@ -40,11 +40,6 @@ sensor_packet_t packet;
 
 bool oledOK = false;  // to allow oled to fail
 
-// to confirm data sent
-void onSend(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  Serial.println("Packet sent (ack may fail due to WiFi mode)");
-}
-
 void setup() {
   Serial.begin(115200);
 
@@ -59,8 +54,12 @@ void setup() {
     delay(10);
   }
 
+  Serial.println("Starting WiFi...");
   // ESP-NOW setup
   WiFi.mode(WIFI_STA);
+  Serial.print("WiFi Channel: ");
+  Serial.println(WiFi.channel());
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
     return;
@@ -73,8 +72,9 @@ void setup() {
   }
   Serial.print("MAC: ");
   Serial.println(WiFi.macAddress());
-*/
+  */
 
+Serial.println("Attempting RTC init...");
   // Check we can find clock module
   if (!rtc.begin()) {
     Serial.println("Couldn't find DS3231");
@@ -98,8 +98,6 @@ void setup() {
     Serial.println("Failed to add peer");
     return;
   }
-
-  esp_now_register_send_cb(onSend);
 
   // Initialize OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -157,7 +155,7 @@ void loop() {
     display.setCursor(x, 0);
     display.print(timeStr);
 
-    // Separator ----
+    // Separator on the LED ----
     display.setTextSize(1);    // Back to normal size
     display.setCursor(0, 24);  // Move down below large time
     display.println("---------------------");
